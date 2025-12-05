@@ -1,263 +1,260 @@
+/*
+ * LoraNode.ino - Client Node (Discovery + Echo + Button Control)
+ * FEATURES: 
+ * - Stable Radio Logic (Non-blocking)
+ * - Short Press: Change ID
+ * - Long Press: Toggle Visibility
+ */
 #include "LoRaWan_APP.h"
 #include "Arduino.h"
 #include "HT_st7735.h"
-#include "../ece-707-lora-common/PacketConfig.h"
+#include "../ece-707-lora-common/PacketConfig.h" 
 
-// --- HARDWARE & CONFIG ---
-HT_st7735 st7735;
-#define USER_BUTTON 0
-
-// --- NODE STATE ---
-uint8_t myID = 1;
+// --- CONFIG ---
+uint8_t myID = 1; // Default start ID
 bool isInvisible = false;
-uint8_t knownNodes[50];
-int knownCount = 0;
 
-// --- BUTTON LOGIC ---
+// --- HARDWARE ---
+HT_st7735 st7735;
+#define USER_BUTTON 0 // GPIO 0 is the "PRG" button on most Heltec boards
+
+// --- BUTTON VARIABLES ---
 unsigned long buttonPressTime = 0;
 bool buttonActive = false;
+bool updateScreen = true;
 
-typedef enum
-{
-  MODE_LISTENING,
-  MODE_TEST_RESPONDER,
-  MODE_ACTIVE_SEARCHER
-} NodeMode_t;
-NodeMode_t currentMode = MODE_LISTENING;
-
-// --- RX/TX VARS ---
-uint8_t rxBuffer[255];
-int16_t rxRssi;
+// --- RADIO VARIABLES ---
 volatile bool packetReceived = false;
 volatile bool txDone = false;
-uint32_t lastRxTime = 0;
+uint8_t rxBuffer[255];
+uint8_t rxSize = 0;
+int16_t lastRssi = 0;
 
-// --- HELPER FUNCTIONS ---
-void UpdateScreen()
-{
-  if (isInvisible)
-  {
-    st7735.st7735_fill_screen(ST7735_RED);
-    st7735.st7735_write_str(10, 30, "INVISIBLE", Font_11x18, ST7735_BLACK);
-    return;
-  }
-  st7735.st7735_fill_screen(ST7735_BLACK);
-  char buf[30];
-  sprintf(buf, "Node ID: %d", myID);
-  st7735.st7735_write_str(0, 0, buf, Font_11x18, ST7735_CYAN);
+// --- STATE MACHINE ---
+typedef enum {
+    S_IDLE,
+    S_BACKOFF,
+    S_SEND_RESP,
+    S_PERFORM_SCAN,
+    S_REPORT_NEIGHBOR,
+    S_REPORT_DONE,
+    S_SEND_ECHO
+} State_t;
 
-  if (currentMode == MODE_LISTENING)
-    st7735.st7735_write_str(0, 20, "Listening...", Font_7x10, ST7735_WHITE);
-  if (currentMode == MODE_TEST_RESPONDER)
-    st7735.st7735_write_str(0, 20, "SF Testing...", Font_7x10, ST7735_MAGENTA);
-  if (currentMode == MODE_ACTIVE_SEARCHER)
-    st7735.st7735_write_str(0, 20, "Scanning...", Font_7x10, ST7735_YELLOW); // Replaced ORANGE
+State_t currentState = S_IDLE;
+unsigned long stateStartTime = 0;
+unsigned long backoffDuration = 0;
 
-  st7735.st7735_write_str(0, 40, "Known Neighbors:", Font_7x10, ST7735_YELLOW);
-  for (int i = 0; i < knownCount && i < 5; i++)
-  {
-    sprintf(buf, "- ID: %d", knownNodes[i]);
-    st7735.st7735_write_str(0, 55 + (i * 10), buf, Font_7x10, ST7735_WHITE);
-  }
+// Scan/Echo Variables
+int echoSF = 12;
+uint8_t foundNeighbors[10];
+int neighborCount = 0;
+int reportIndex = 0;
+
+// --- HELPER: UPDATE SCREEN ---
+void UpdateScreen() {
+    st7735.st7735_fill_screen(ST7735_BLACK);
+    
+    // Header
+    char buf[20];
+    sprintf(buf, "NODE ID: %d", myID);
+    st7735.st7735_write_str(0, 0, buf, Font_7x10, ST7735_CYAN);
+    
+    // Status
+    if (isInvisible) {
+        st7735.st7735_write_str(0, 20, "STATUS: HIDDEN", Font_7x10, ST7735_MAGENTA);
+        st7735.st7735_write_str(0, 40, "(Ignor. Discovery)", Font_7x10, ST7735_WHITE);
+    } else {
+        st7735.st7735_write_str(0, 20, "STATUS: VISIBLE", Font_7x10, ST7735_GREEN);
+        st7735.st7735_write_str(0, 40, "Listening...", Font_7x10, ST7735_WHITE);
+    }
 }
 
-void ConfigRadioSF(int sf)
-{
-  Radio.SetTxConfig(MODEM_LORA, TX_OUTPUT_POWER, 0, LORA_BANDWIDTH, sf, LORA_CODINGRATE, 8, false, true, 0, 0, false, 3000);
-  Radio.SetRxConfig(MODEM_LORA, LORA_BANDWIDTH, sf, LORA_CODINGRATE, 0, 8, 0, false, 0, true, 0, 0, false, true);
-}
-
-void SendPacket(uint8_t dest, uint8_t type, uint8_t d1, uint8_t d2)
-{
-  uint8_t packet[10];
-  packet[0] = dest;
-  packet[1] = myID;
-  packet[2] = type;
-  packet[3] = d1;
-  packet[4] = d2;
-
-  txDone = false;
-  Radio.Send(packet, 5);
-
-  // BLOCKING WAIT
-  unsigned long start = millis();
-  while (!txDone && millis() - start < 1000)
-  {
-    Radio.IrqProcess();
-  }
-}
-
-bool isKnown(uint8_t id)
-{
-  for (int i = 0; i < knownCount; i++)
-    if (knownNodes[i] == id)
-      return true;
-  return false;
-}
-
-void addKnown(uint8_t id)
-{
-  if (!isKnown(id) && knownCount < 50)
-  {
-    knownNodes[knownCount++] = id;
-    UpdateScreen();
-  }
+// --- RADIO CONFIG ---
+void ConfigRadio(int sf) {
+    Radio.SetTxConfig(MODEM_LORA, TX_OUTPUT_POWER, 0, LORA_BANDWIDTH, sf, LORA_CODINGRATE,
+                      LORA_PREAMBLE_LEN, LORA_FIX_LENGTH_PAYLOAD_ON, true, 0, 0, LORA_IQ_INVERSION_ON, 3000);
+    Radio.SetRxConfig(MODEM_LORA, LORA_BANDWIDTH, sf, LORA_CODINGRATE, 0, LORA_PREAMBLE_LEN,
+                      LORA_SYMBOL_TIMEOUT, LORA_FIX_LENGTH_PAYLOAD_ON, 0, true, 0, 0, LORA_IQ_INVERSION_ON, true);
+    Radio.Rx(0);
 }
 
 // --- INTERRUPTS ---
-void OnTxDone()
-{
-  txDone = true;
-  Radio.Rx(RX_TIMEOUT_VALUE);
+void OnTxDone(void) { txDone = true; Radio.Rx(0); }
+void OnRxDone(uint8_t *payload, uint16_t size, int16_t rssi, int8_t snr) {
+    if (size > sizeof(rxBuffer)) size = sizeof(rxBuffer);
+    memcpy(rxBuffer, payload, size);
+    rxSize = size;
+    lastRssi = rssi;
+    packetReceived = true;
 }
-void OnTxTimeout()
-{
-  txDone = true;
-  Radio.Rx(RX_TIMEOUT_VALUE);
-}
-void OnRxDone(uint8_t *payload, uint16_t size, int16_t rssi, int8_t snr)
-{
-  if (isInvisible)
-    return;
-  memcpy(rxBuffer, payload, size);
-  rxRssi = rssi;
-  packetReceived = true;
-}
-void OnRxTimeout()
-{
-  Radio.Rx(RX_TIMEOUT_VALUE);
-}
+void OnTxTimeout(void) { Radio.Rx(0); }
+void OnRxTimeout(void) { }
+void OnRxError(void) { }
 
-void setup()
-{
-  Serial.begin(115200);
-  Mcu.begin(HELTEC_BOARD, SLOW_CLK_TPYE);
-  st7735.st7735_init();
-  pinMode(USER_BUTTON, INPUT);
+void setup() {
+    Serial.begin(115200);
+    Mcu.begin(HELTEC_BOARD, 0);
+    
+    pinMode(USER_BUTTON, INPUT); // Button is active LOW
 
-  RadioEvents_t RadioEvents;
-  RadioEvents.TxDone = OnTxDone;
-  RadioEvents.TxTimeout = OnTxTimeout;
-  RadioEvents.RxDone = OnRxDone;
-  RadioEvents.RxTimeout = OnRxTimeout;
-  Radio.Init(&RadioEvents);
-  Radio.SetChannel(RF_FREQUENCY);
-  ConfigRadioSF(12);
-
-  UpdateScreen();
-  Radio.Rx(RX_TIMEOUT_VALUE);
-}
-
-void loop()
-{
-  // --- BUTTON HANDLING ---
-  if (digitalRead(USER_BUTTON) == LOW)
-  {
-    if (!buttonActive)
-    {
-      buttonActive = true;
-      buttonPressTime = millis();
-    }
-  }
-  else
-  {
-    if (buttonActive)
-    {
-      unsigned long duration = millis() - buttonPressTime;
-      buttonActive = false;
-      if (duration > 1000)
-      {
-        isInvisible = !isInvisible;
-      }
-      else
-      {
-        myID++;
-        if (myID > 20)
-          myID = 1;
-      }
-      UpdateScreen();
-      Radio.Sleep();
-      Radio.Rx(RX_TIMEOUT_VALUE);
-    }
-  }
-
-  if (isInvisible)
-  {
-    delay(100);
-    return;
-  }
-
-  Radio.IrqProcess();
-
-  // Packet Handling
-  if (packetReceived)
-  {
-    packetReceived = false;
-    uint8_t dest = rxBuffer[0];
-    uint8_t sender = rxBuffer[1];
-    uint8_t type = rxBuffer[2];
-
-    if (dest != myID && dest != BROADCAST_ADDR)
-    {
-      Radio.Rx(RX_TIMEOUT_VALUE);
-      return;
-    }
-
-    if (type == PKT_DISCOVERY_REQ)
-    {
-      delay(random(100, BACKOFF_MAX_DELAY));
-      SendPacket(sender, PKT_DISCOVERY_RESP, 0, 0);
-      addKnown(sender);
-    }
-    else if (type == PKT_SF_TEST)
-    {
-      currentMode = MODE_TEST_RESPONDER;
-      UpdateScreen();
-      int receivedSF = rxBuffer[3];
-      ConfigRadioSF(receivedSF);
-      delay(10);
-      SendPacket(sender, PKT_SF_ACK, 0, 0);
-      lastRxTime = millis();
-      addKnown(sender);
-    }
-    else if (type == PKT_CMD_SEARCH)
-    {
-      currentMode = MODE_ACTIVE_SEARCHER;
-      UpdateScreen();
-      ConfigRadioSF(12);
-      SendPacket(BROADCAST_ADDR, PKT_DISCOVERY_REQ, 0, 0);
-
-      unsigned long scanStart = millis();
-      while (millis() - scanStart < DISCOVERY_TIMEOUT)
-      {
-        Radio.IrqProcess();
-        if (packetReceived)
-        {
-          packetReceived = false;
-          if (rxBuffer[2] == PKT_DISCOVERY_RESP && rxBuffer[0] == myID)
-          {
-            uint8_t foundID = rxBuffer[1];
-            SendPacket(BASE_STATION_ID, PKT_REPORT_NODE, foundID, 0);
-            addKnown(foundID);
-            delay(200);
-          }
-          Radio.Rx(RX_TIMEOUT_VALUE);
-        }
-      }
-      SendPacket(BASE_STATION_ID, PKT_SEARCH_DONE, 0, 0);
-      currentMode = MODE_LISTENING;
-      UpdateScreen();
-    }
-
-    // IMPORTANT: Restart RX if we handled a packet but didn't send a response (which auto-restarts RX)
-    Radio.Rx(RX_TIMEOUT_VALUE);
-  }
-
-  if (currentMode == MODE_TEST_RESPONDER && millis() - lastRxTime > 5000)
-  {
-    currentMode = MODE_LISTENING;
-    ConfigRadioSF(12);
+    st7735.st7735_init();
     UpdateScreen();
-    Radio.Rx(RX_TIMEOUT_VALUE);
-  }
+
+    static RadioEvents_t RadioEvents;
+    RadioEvents.TxDone = OnTxDone;
+    RadioEvents.RxDone = OnRxDone;
+    RadioEvents.TxTimeout = OnTxTimeout;
+    RadioEvents.RxTimeout = OnRxTimeout;
+    RadioEvents.RxError = OnRxError;
+    Radio.Init(&RadioEvents);
+    Radio.SetChannel(RF_FREQUENCY);
+    
+    ConfigRadio(12); // Default Listener
+}
+
+void loop() {
+    Radio.IrqProcess();
+
+    // --- BUTTON LOGIC ---
+    // Read button (Active LOW: 0=Pressed, 1=Released)
+    if (digitalRead(USER_BUTTON) == LOW) {
+        if (!buttonActive) {
+            buttonActive = true;
+            buttonPressTime = millis();
+        }
+    } else {
+        if (buttonActive) {
+            buttonActive = false;
+            unsigned long duration = millis() - buttonPressTime;
+            
+            if (duration > 1000) {
+                // LONG PRESS: Toggle Invisible
+                isInvisible = !isInvisible;
+            } else if (duration > 50) {
+                // SHORT PRESS: Change ID
+                myID++;
+                if (myID > 10) myID = 1; // Cycle 1-10
+            }
+            UpdateScreen();
+        }
+    }
+
+    // --- STATE MACHINE ---
+    switch (currentState) {
+        case S_IDLE:
+            if (packetReceived) {
+                packetReceived = false;
+                
+                // CASE 1: Discovery Request
+                if ((rxBuffer[0] == 0xFF || rxBuffer[0] == myID) && rxBuffer[2] == PKT_DISCOVERY_REQ) {
+                    // ONLY REPLY IF VISIBLE
+                    if (!isInvisible) {
+                        st7735.st7735_write_str(0, 60, "Discovery Req! ", Font_7x10, ST7735_YELLOW);
+                        backoffDuration = random(100, BACKOFF_MAX_DELAY);
+                        stateStartTime = millis();
+                        currentState = S_BACKOFF;
+                    } else {
+                        // Log ignored packet?
+                        Serial.println("Ignored Discovery (Invisible)");
+                    }
+                }
+
+                // CASE 2: Remote Scan Command
+                else if (rxBuffer[0] == myID && rxBuffer[2] == PKT_SCAN_CMD) {
+                    st7735.st7735_write_str(0, 60, "Scanning Area...", Font_7x10, ST7735_MAGENTA);
+                    neighborCount = 0;
+                    
+                    // Broadcast scan
+                    uint8_t tx[5] = {0xFF, myID, PKT_DISCOVERY_REQ, 0, 0};
+                    ConfigRadio(12);
+                    txDone = false;
+                    Radio.Send(tx, 5);
+                    stateStartTime = millis();
+                    currentState = S_PERFORM_SCAN;
+                }
+                
+                // CASE 3: SF Link Test
+                else if (rxBuffer[0] == myID && rxBuffer[2] == PKT_SF_TEST) {
+                    echoSF = rxBuffer[3]; 
+                    st7735.st7735_write_str(0, 60, "Echoing Test... ", Font_7x10, ST7735_YELLOW);
+                    currentState = S_SEND_ECHO;
+                }
+            }
+            break;
+
+        case S_BACKOFF:
+            if (millis() - stateStartTime > backoffDuration) currentState = S_SEND_RESP;
+            break;
+
+        case S_SEND_RESP:
+            {
+                st7735.st7735_write_str(0, 60, "Sending Hello...", Font_7x10, ST7735_GREEN);
+                uint8_t tx[5] = {0, myID, PKT_DISCOVERY_RESP, 0, 0};
+                ConfigRadio(12);
+                txDone = false;
+                Radio.Send(tx, 5);
+                unsigned long t = millis();
+                while(!txDone && millis()-t < 1000) Radio.IrqProcess();
+                
+                currentState = S_IDLE;
+                st7735.st7735_write_str(0, 60, "               ", Font_7x10, ST7735_BLACK);
+            }
+            break;
+            
+        case S_SEND_ECHO:
+            {
+                ConfigRadio(echoSF);
+                delay(10);
+                uint8_t tx[5] = {0, myID, PKT_SF_TEST, echoSF, 0};
+                txDone = false;
+                Radio.Send(tx, 5);
+                
+                unsigned long t = millis();
+                while(!txDone && millis()-t < 1000) Radio.IrqProcess();
+                
+                ConfigRadio(12); // Revert to listener
+                currentState = S_IDLE;
+                st7735.st7735_write_str(0, 60, "               ", Font_7x10, ST7735_BLACK);
+            }
+            break;
+
+        case S_PERFORM_SCAN:
+            if (packetReceived) {
+                packetReceived = false;
+                if (rxBuffer[2] == PKT_DISCOVERY_RESP && neighborCount < 10) {
+                    foundNeighbors[neighborCount++] = rxBuffer[1];
+                }
+            }
+            if (millis() - stateStartTime > DISCOVERY_TIMEOUT) {
+                reportIndex = 0;
+                currentState = S_REPORT_NEIGHBOR;
+            }
+            break;
+
+        case S_REPORT_NEIGHBOR:
+            if (reportIndex < neighborCount) {
+                ConfigRadio(12);
+                uint8_t tx[5] = {0, myID, PKT_REPORT_NODE, foundNeighbors[reportIndex], 0};
+                txDone = false;
+                Radio.Send(tx, 5);
+                unsigned long t = millis();
+                while(!txDone && millis()-t < 1000) Radio.IrqProcess();
+                reportIndex++;
+                delay(200);
+            } else {
+                currentState = S_REPORT_DONE;
+            }
+            break;
+
+        case S_REPORT_DONE:
+            {
+                ConfigRadio(12);
+                uint8_t tx[5] = {0, myID, PKT_SCAN_DONE, 0, 0};
+                Radio.Send(tx, 5);
+                currentState = S_IDLE;
+                UpdateScreen(); // Clear status msg
+            }
+            break;
+    }
 }
