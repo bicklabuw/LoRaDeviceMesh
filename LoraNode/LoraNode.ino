@@ -59,7 +59,7 @@ void UpdateIDScreen()
   st7735.st7735_fill_screen(ST7735_BLACK);
   char buf[20];
   sprintf(buf, "NODE ID: %d", myID);
-  st7735.st7735_write_str(0, 0, buf, Font_7x10, ST7735_MAGENTA);
+  st7735.st7735_write_str(0, 0, buf, Font_7x10, ST7735_WHITE);
   st7735.st7735_write_str(0, 20, "Listening...", Font_7x10, ST7735_GREEN);
 }
 
@@ -129,8 +129,8 @@ void loop()
     if (digitalRead(USER_BUTTON) == LOW)
     {
       myID++;
-      if (myID > 10)
-        myID = 1; // Cycle 1-10
+      if (myID > 254)
+        myID = 1; // Cycle 1-254
       EEPROM.write(0, myID);
       EEPROM.commit();
       randomSeed(analogRead(0) + myID);
